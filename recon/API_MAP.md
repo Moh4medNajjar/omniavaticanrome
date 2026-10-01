@@ -330,7 +330,7 @@ Placeholders: `$FORM_TOKEN` and `$CSRF` are per-session Rails tokens, and the co
 ## 7. Gaps and unknowns
 
 1. **Payment was not exercised** (intended). The `/vouchers/pay` response, PSP redirect domains (PayPal, "Moneta"/Nexi, the latter inferred), callback and return URLs, and the `vouchers#thankyoupage` route path are all unknown.
-2. **Side effect of capture 2:** it placed **4 temporary reservation holds**, codes RSAB2097331T–RSAB2097334C, for 28-09-2026 in an abandoned session. How long a hold lasts, and whether it expires server-side, is unknown. Re-run with `NO_HOLD=1` to skip the add-to-cart step.
+2. **Side effect of capture 2:** it placed **4 temporary reservation holds**, codes RSAB2097331T–RSAB2097334C, for 28-09-2026 in an abandoned session. A later test (2026-10-01) measured the hold lifetime: the site releases an unpaid hold after 15 minutes, see `HOLD_TTL.md`. Re-run with `NO_HOLD=1` to skip the add-to-cart step.
 3. `/en/cards/fix_pax` (the EN form action, versus `set_pax` in IT) was not exercised. `/change-language?...` returned 404, so the language switcher appears broken.
 4. Some branches were not reached on this product: guided-visit groups and languages (card 69), `load_products` and `load_supplements` +/- endpoints, supplements (`window.supplements` was `{}`), and Omnia pass purchase without reservation. Their form actions are rendered server-side and do not appear in the captured HTML.
 5. The iubenda "accept" button was not matched, so consent was never explicitly granted. Consent-gated GTM tags (Ads/GA) may therefore be missing. GTM only references the legacy UA-141572781-1, and no Google collect hits were seen.
