@@ -132,7 +132,7 @@ const step = (msg) => console.log(`• ${msg}`);
   const page = await ctx.newPage();
   await page.goto(`${BASE}${h2.url || `/${LOC}/vouchers/checkout`}`);
   console.log('\n✔ Checkout is open in the browser window. Fill in your details, click "Procedi" and pay there.');
-  console.log('  The session expires after 2 hours of inactivity; finish within a few minutes to be safe.');
+  console.log('  The site releases unpaid tickets 15 minutes after they were held (see recon/HOLD_TTL.md): pay before then.');
   console.log('  Close the browser window when you are done.');
   browser.on('disconnected', () => process.exit(0));
 })().catch((e) => { console.error(`✖ ${e.message}`); process.exit(1); });
