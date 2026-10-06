@@ -1,0 +1,16 @@
+{
+  "private": true,
+  "description": "Omnia Vatican Rome ticket tools",
+  "scripts": {
+    "sniper": "node --env-file=.env sniper.js",
+    "watch": "node --env-file=.env slot_watch.js",
+    "book": "node --env-file=.env book.js",
+    "seats": "node --env-file=.env seats.js"
+  },
+  "dependencies": {
+    "undici": "^7.0.0"
+  },
+  "optionalDependencies": {
+    "playwright": "^1.63.0"
+  }
+}

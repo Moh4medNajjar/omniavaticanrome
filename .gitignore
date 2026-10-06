@@ -1,25 +1,14 @@
-# Dependencies
 node_modules/
 
-# Secrets / local config
+# Secrets
 .env
 .env.*
 
-# Captured traffic: contains session cookies, CSRF tokens and your IP (never commit)
-recon/out/
-recon/out2/
-recon/pages/
-recon/catalog/
-recon/official/
-*.har
-cookies.json
-storage.json
-jar.txt
+# Logs (regenerated at runtime)
 *.log
-recon/_*.txt
 
 # Runtime state
-monitor/state.json
+state.json
 
 # Playwright artifacts
 test-results/
