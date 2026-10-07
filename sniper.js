@@ -23,6 +23,17 @@ const SCAN_DAYS = Number(process.env.SCAN_DAYS || 60);
 const WORKERS = Math.min(4, Math.max(1, Number(process.env.SNIPE_WORKERS || 3)));
 const RUSH_SHOTS = WORKERS + 2;
 const RUSH_MS = 6000;
+// Re-hold team: sessions opened a few minutes ahead and kept idle until the re-hold.
+const TEAM_SIZE = 5;
+// Shooters that did not win are kept for the next re-hold, up to this age.
+const TEAM_MAX_AGE_MS = 25 * 60e3;
+// Re-hold shooters connect from the server itself: the proxy adds latency to every shot
+// (direct: the rival won 4 of 9 re-holds; through the proxy: 5 of 8).
+const REHOLD_DIRECT = process.env.REHOLD_DIRECT !== 'false';
+const TEAM_LEAD_MS = 4 * 60e3;
+// When someone takes our seats, their own hold ends 15 min later unless they pay.
+const CATCHUP_AT_MS = 14.5 * 60e3;
+const CATCHUP_RUSH_MS = 75e3;
 const GAP_MS = Math.max(0, Number(process.env.SNIPE_GAP_MS || 0));
 const KEEPALIVE_MS = Number(process.env.REHOLD_SEC || 780) * 1000;
 const MAX_QTY = 7;
@@ -288,14 +299,14 @@ function cmCandidates(cmSlots, clSlot) {
 
 // ── Site operations ────────────────────────────────────
 // The session's party size must equal the ticket count, or the cart comes out broken.
-async function newSession(qty) {
-  const proxyUrl = nextProxy();
+async function newSession(qty, { direct = false } = {}) {
+  const proxyUrl = direct ? null : nextProxy();
   const client = makeClient(proxyUrl);
   try {
     const { csrf } = await openSession(client, { adults: qty });
     if (proxyUrl) { S.proxyFails = 0; S.proxyWarned = false; }
     return {
-      client, csrf, proxyUrl,
+      client, csrf, proxyUrl, qty,
       bornAt: Date.now(), maxAge: SESSION_MAX_MS * (0.8 + 0.4 * Math.random()),
     };
   } catch (e) {
@@ -348,6 +359,20 @@ async function deleteCodes(sess, codes) {
   }));
 }
 
+// The fastest possible release for a re-hold: ONE request (it frees every code in the
+// cart, measured), resolving the moment its reply arrives, which is when the shooters
+// fire. If that reply does not confirm the codes are gone, the full release runs.
+async function releaseFast(sess, codes) {
+  try {
+    const r = await sess.client.http('POST', `${BASE}/${LOC}/vouchers/delete_reservations`, {
+      headers: xhrHeaders(sess.csrf), form: { reservations: codes.join('**'), buy_area: 'CL' },
+    });
+    const still = reservationCodes(JSON.parse(r.text).html);
+    if (r.status === 200 && !codes.some((c) => still.includes(c))) return;
+  } catch {}
+  await deleteCodes(sess, codes);
+}
+
 // A code in a reply is not proof; the checkout page is. The cart counts only if that
 // page lists every reservation we think we hold. If the page cannot be read at all the
 // catch is kept, marked as not checked.
@@ -398,7 +423,8 @@ function makeJob({ date, clSlot, cmSlots, qty }) {
     timer: null, busy: false, paying: 0, lastProxyAt: 0, swapAt: 0, rushUntil: 0,
     // Stacking: tickets in the cart so far, people announced to the site but not booked
     // yet, and a queue that keeps work on the cart session one step at a time.
-    have: 0, pending: 0, batches: 1, renewals: 0, chain: Promise.resolve(), topping: null, topTries: 0, topLast: '—', swapFulls: 0,
+    have: 0, pending: 0, batches: 1, renewals: 0, team: [], teamTimer: null, catchupTimer: null, swapHave: 0,
+    chain: Promise.resolve(), topping: null, topTries: 0, topLast: '—', swapFulls: 0,
   };
 }
 
@@ -462,20 +488,30 @@ function hunt(job, warm = [], freed = null) {
   const gen = ++job.gen;
   const n = Math.max(WORKERS, warm.length);
   const step = Math.round(Math.min(1500, Math.max(300, job.lastMs || 800)) / n);
+  // Shots fired before the release reply only slowed the site at the decisive moment
+  // (measured: the rival won 4 of 9 with them, 2 of 8 without), so there are none.
+  const preShots = 0;
   for (let i = 0; i < n; i++) {
     const start = {
       // A stuck release must not hold the second half back for long.
-      after: freed && i % 2 ? Promise.race([freed, sleep(3000)]) : null,
-      delay: freed ? Math.floor(i / 2) * 150 : i * step,
+      // Re-hold: shooter 0 fires with the release and keeps firing; the rest fire the
+      // instant its reply arrives (40 ms apart), when the seat has just come free.
+      after: freed && i > preShots ? Promise.race([freed, sleep(3000)]) : null,
+      delay: !freed ? i * step : i === 0 ? 0 : i <= preShots ? 250 + (i - 1) * 200 : (i - preShots - 1) * 40,
       extra: i >= WORKERS,
+      rehold: !!freed,
     };
     const p = huntWorker(job, gen, warm[i] || null, start)
       .catch((e) => log(`⚠️ worker crashed: ${errText(e)}`))
       .finally(() => S.workers.delete(p));
     S.workers.add(p);
   }
-  if (!freed && !job.have && job.qty > 1) {
-    const p = partialScout(job, gen)
+  // A plain hunt with nothing yet takes smaller openings. A re-hold that does not land
+  // checks whether someone took part of the seats, and keeps what is left.
+  const scout = !freed && !job.have && job.qty > 1 ? { max: job.qty - 1 }
+    : freed && job.have > 1 ? { max: job.have, firstDelay: 2500, partialOnly: true } : null;
+  if (scout) {
+    const p = partialScout(job, gen, scout)
       .catch((e) => log(`⚠️ scout crashed: ${errText(e)}`))
       .finally(() => S.workers.delete(p));
     S.workers.add(p);
@@ -483,7 +519,7 @@ function hunt(job, warm = [], freed = null) {
   saveState();
 }
 
-async function huntWorker(job, gen, sess, { after, delay, extra }) {
+async function huntWorker(job, gen, sess, { after, delay, extra, rehold }) {
   const mine = () => job.gen === gen && job.state === 'hunting';
   // A re-hold that has just freed its seats keeps firing even during shutdown.
   const quitting = () => S.stopping && !rushing(job);
@@ -499,7 +535,8 @@ async function huntWorker(job, gen, sess, { after, delay, extra }) {
   while (mine()) {
     if (!strikes && (quitting() || (extra && !rushing(job)))) break;
     try {
-      if (sess && !strikes && Date.now() - sess.bornAt > sess.maxAge) { sess.client.close(); sess = null; }
+      // (Re-hold shooters are exempt: replacing one now would make it miss its moment.)
+      if (sess && !strikes && !rehold && Date.now() - sess.bornAt > sess.maxAge) { sess.client.close(); sess = null; }
       if (!sess) sess = await newSession(want);
       const rush = rushing(job);
       if (!rush) {
@@ -529,6 +566,7 @@ async function huntWorker(job, gen, sess, { after, delay, extra }) {
         job.bad = 0;
         job.rushUntil = 0;
         log(`🎉 Caught ${want}× Colosseo ${job.clSlot.time} on ${job.date} after ${job.attempts.toLocaleString('en')} tries — adding Carcere...`);
+        job.caughtReplyAt = Date.now();
         const won = sess;
         sess = null;
         await secure(job, won, r.codes, t0, want);
@@ -554,7 +592,14 @@ async function huntWorker(job, gen, sess, { after, delay, extra }) {
       await sleep(1000);
     }
   }
-  if (sess) await dropSession(sess, strikes > 0);
+  if (!sess) return;
+  // A re-hold shooter that lost is still a clean, ready session: keep it for next time.
+  if (rehold && !strikes && sess.qty && Date.now() - sess.bornAt < TEAM_MAX_AGE_MS
+      && (job.state === 'securing' || job.state === 'held') && job.team.length < TEAM_SIZE) {
+    job.team.push(sess);
+    return;
+  }
+  await dropSession(sess, strikes > 0);
 }
 
 // Adds the Carcere half to the cart that already holds the Colosseo tickets, then
@@ -609,8 +654,73 @@ function setHeld(job, sess, cmSlot, codes, heldAt, cart, have) {
     cmSlot, codes, heldAt, cart: cart || null, have, pending: 0, batches: 1, renewals: 0,
   });
   if (!job.paying) scheduleKeepAlive(job, Math.max(5000, heldAt + KEEPALIVE_MS - Date.now()));
+  scheduleTeam(job);
   saveState();
   startTopUp(job);
+}
+
+// ── Re-hold team ───────────────────────────────────────
+// A few sessions are opened shortly before each re-hold and left idle, so at the re-hold
+// itself no time goes into opening them and they have not been slowed by earlier use.
+// They are sorted by how fast they opened: the fastest fires the first shot.
+function scheduleTeam(job) {
+  clearTimeout(job.teamTimer);
+  const wait = job.heldAt + KEEPALIVE_MS - TEAM_LEAD_MS - Date.now();
+  job.teamTimer = setTimeout(() => prepareTeam(job).catch((e) => log(`⚠️ team: ${errText(e)}`)), Math.max(1000, wait));
+}
+
+async function prepareTeam(job) {
+  if (job.state !== 'held' || job.paying || S.stopping) return;
+  // Sessions announce a party size; ones made for another size, or too old, go.
+  const keep = (x) => x.qty === job.have && Date.now() - x.bornAt < TEAM_MAX_AGE_MS;
+  for (const t of job.team.filter((x) => !keep(x))) t.client.close();
+  job.team = job.team.filter(keep);
+  while (job.team.length < TEAM_SIZE && job.state === 'held' && !S.stopping) {
+    const t0 = Date.now();
+    try {
+      const sess = await newSession(job.have, { direct: REHOLD_DIRECT });
+      sess.openMs = Date.now() - t0;
+      if (job.state !== 'held') { sess.client.close(); break; }
+      job.team.push(sess);
+    } catch (e) {
+      noteError(e);
+      await sleep(2000);
+    }
+  }
+  job.team.sort((a, b) => (a.openMs || 9e9) - (b.openMs || 9e9));
+  if (job.team.length) {
+    log(`🧰 ${jobName(job)}: ${job.team.length} shooters ready for the re-hold (open times ${job.team.map((t) => t.openMs).join('/')}ms)`);
+  }
+}
+
+function dropTeam(job) {
+  clearTimeout(job.teamTimer);
+  for (const t of job.team || []) t.client.close();
+  job.team = [];
+}
+
+const teamReady = (job) => job.team.filter((x) => x.qty === job.have).length >= 2;
+
+// Someone took our seats at `at`. Unless they pay, their hold ends 15 minutes later:
+// a burst of extra shooters then, on top of the normal hunt, takes the seats back.
+function scheduleCatchup(job, at) {
+  clearTimeout(job.catchupTimer);
+  job.catchupTimer = setTimeout(() => catchupBurst(job).catch((e) => log(`⚠️ catchup: ${errText(e)}`)),
+    Math.max(1000, at + CATCHUP_AT_MS - Date.now()));
+  log(`⏰ ${jobName(job)}: catchup burst planned for ${new Date(at + CATCHUP_AT_MS).toTimeString().slice(0, 8)}`);
+}
+
+async function catchupBurst(job) {
+  if (job.state !== 'hunting' || S.stopping) return;
+  const want = job.have || job.qty;
+  const warm = [];
+  for (let i = 0; i < TEAM_SIZE; i++) {
+    try { warm.push(await newSession(want)); } catch (e) { noteError(e); }
+  }
+  if (job.state !== 'hunting') { warm.forEach((x) => x.client.close()); return; }
+  log(`⏰ ${jobName(job)}: catchup burst — ${warm.length} extra shooters for ${CATCHUP_RUSH_MS / 1000}s`);
+  job.rushUntil = Date.now() + CATCHUP_RUSH_MS;
+  hunt(job, warm);
 }
 
 async function onCaught(job) {
@@ -620,7 +730,14 @@ async function onCaught(job) {
   log(`✅ SECURED ${job.have}/${job.qty} of ${jobName(job)} + Carcere ${job.cmSlot.time} — ${job.codes.join(', ')}` +
     ` — cart ${c?.checked ? `checked: ${c.people} people, ${c.total} €` : 'not checked'} — ${checkoutLink(job)}`);
   if (reason === 'swap') {
-    editJobMsgs(job, heldText(job, '♻️ Re-held, timer reset'), heldKb(job));
+    const lost = job.swapHave - job.have;
+    log(`♻️ Re-held ${job.have} of ${jobName(job)} by hand-over: seats back ${job.caughtReplyAt - job.swapAt}ms after the release was sent`);
+    editJobMsgs(job, heldText(job, lost > 0 ? `⚠️ ${lost} seat(s) taken during the re-hold — stacking to get them back` : '♻️ Re-held, timer reset'), heldKb(job));
+    if (lost > 0) {
+      log(`⚠️ ${jobName(job)}: ${lost} seat(s) taken during the re-hold, kept ${job.have}`);
+      tgNotify(`⚠️ <b>${jobName(job)}</b>: someone took ${lost} seat(s) during the re-hold.\nKept ${job.have}, stacking to get the rest back.`);
+      scheduleCatchup(job, job.swapAt);
+    }
     return;
   }
   editJobMsgs(job, `✅ Caught ${job.have} of ${jobName(job)} after ${job.attempts.toLocaleString('en')} tries — details below 👇`);
@@ -712,13 +829,16 @@ async function seatsFree(job, max) {
 
 // While a hunt has nothing yet, the workers ask for everything at once. This looks every
 // 15s for a smaller number of free seats and takes them as the first batch.
-async function partialScout(job, gen) {
+async function partialScout(job, gen, { max, firstDelay = PROBE_MS, partialOnly = false }) {
   const mine = () => job.gen === gen && job.state === 'hunting' && !S.stopping;
+  let wait = firstDelay;
   while (mine()) {
-    await sleep(PROBE_MS);
+    await sleep(wait);
+    wait = PROBE_MS;
     if (!mine()) break;
-    const k = await seatsFree(job, job.qty - 1).catch(() => 0);
-    if (!k || !mine()) continue;
+    const k = await seatsFree(job, max).catch(() => 0);
+    // partialOnly: if all the seats are still free the re-hold rush will get them.
+    if (!k || (partialOnly && k >= max) || !mine()) continue;
     log(`🔎 ${jobName(job)}: ${k} seat(s) free right now — taking them`);
     let sess = null;
     try {
@@ -880,9 +1000,14 @@ async function keepAlive(job) {
       return;
     }
     job.rushUntil = Date.now() + 20e3;
-    const res = await renewInPlace(job);
+    const res = await renewInPlace(job, { inPlace: !teamReady(job) });
     job.rushUntil = 0;
+    if (res.noSpare) {
+      await swapToFreshSessions(job);
+      return;
+    }
     if (res.how) {
+      scheduleTeam(job);
       job.renewals++;
       log(`♻️ Re-held ${job.have} of ${jobName(job)} ${res.how} in ${res.ms}ms (${res.steps}) — ${job.codes.join(', ')}`);
       saveState();
@@ -918,7 +1043,7 @@ async function keepAlive(job) {
 //    waiting batch at once (the seats are free for well under a second).
 // Returns { how, ms } on success, or { error, freed } where freed tells whether the old
 // reservations were already released when it failed.
-async function renewInPlace(job) {
+async function renewInPlace(job, { inPlace = true } = {}) {
   return withCart(job, async () => {
     const sess = { client: job.client, csrf: job.csrf };
     const n = job.have;
@@ -943,6 +1068,9 @@ async function renewInPlace(job) {
       const spare = await withScout((c, csrf) => getSlots(c, csrf, 'CL', job.date, n))
         .then((slots) => slots.some((x) => x.time === job.clSlot.time), () => false);
       mark('spare?');
+      // No spare seats and a team is ready: the hand-over to the team is faster and
+      // keeps several requests in flight, so nothing in this cart is touched.
+      if (!spare && !inPlace) return { noSpare: true, freed: false };
       let bookedAt = Date.now();
       let info = before;
       if (spare) {
@@ -1054,13 +1182,16 @@ async function swapToFreshSessions(job) {
   // Let the stacking loop finish its step, so nothing lands in the old cart afterwards.
   await job.topping;
   await job.chain;
-  log(`🔄 Re-holding ${job.have} of ${jobName(job)}: preparing ${RUSH_SHOTS} sessions...`);
   const usable = () => job.state === 'held' && !job.paying && !S.stopping;
   const left = () => HOLD_TTL_MS - (Date.now() - job.heldAt);
-  // Preparing must never run past the hold: each open is cut off 45s before it expires,
-  // and the swap then goes ahead with whatever sessions are ready (workers open their own).
-  const warm = [];
-  for (let i = 0; i < RUSH_SHOTS && usable() && left() > 45e3; i++) {
+  // The prepared team, fastest first. Only if it is missing or too small are sessions
+  // opened now, and that is cut off 45s before the hold expires.
+  const warm = job.team.filter((x) => x.qty === job.have);
+  job.team.filter((x) => x.qty !== job.have).forEach((x) => x.client.close());
+  job.team = [];
+  clearTimeout(job.teamTimer);
+  log(`🔄 Re-holding ${job.have} of ${jobName(job)}: ${warm.length ? `handing over to ${warm.length} prepared shooters` : `preparing ${RUSH_SHOTS} sessions`}...`);
+  for (let i = warm.length; i < (warm.length >= 2 ? 0 : RUSH_SHOTS) && usable() && left() > 45e3; i++) {
     const opening = newSession(job.have).catch((e) => { noteError(e); return null; });
     const sess = await Promise.race([opening, sleep(left() - 45e3).then(() => undefined)]);
     if (sess === undefined) opening.then((late) => late?.client.close());
@@ -1075,9 +1206,10 @@ async function swapToFreshSessions(job) {
   job.huntReason = 'swap';
   job.swapAt = Date.now();
   job.swapFulls = 0;
+  job.swapHave = job.have;
   // The rush window proper starts when the site confirms the release.
   job.rushUntil = Date.now() + 30e3;
-  const freeing = deleteCodes(old, oldCodes);
+  const freeing = releaseFast(old, oldCodes);
   hunt(job, warm, freeing);
   await freeing;
   if (rushing(job)) job.rushUntil = Date.now() + RUSH_MS;
@@ -1123,6 +1255,8 @@ async function stopJob(job, { keep = false, head } = {}) {
   job.state = 'done';
   job.gen++;
   clearTimeout(job.timer);
+  clearTimeout(job.catchupTimer);
+  dropTeam(job);
   S.jobs = S.jobs.filter((j) => j !== job);
   saveState();
   await job.topping;
@@ -1247,7 +1381,7 @@ function statusTicker() {
       log(`⚠️ ${jobName(job)}: seats were taken during the re-hold — hammering to get them back`);
       tgNotify(`⚠️ <b>${jobName(job)}</b>: someone took the seats during the re-hold.\n🎯 Hammering to get them back...`);
       // Back to a full hunt: take any number of seats again, up to the whole order.
-      if (job.state === 'hunting') { job.have = 0; hunt(job); }
+      if (job.state === 'hunting') { job.have = 0; hunt(job); scheduleCatchup(job, job.swapAt); }
       continue;
     }
     if ((tick + job.id) % every === 0) {
@@ -1456,6 +1590,52 @@ function startCheckoutProxy() {
 // cloudflared prints one, and the tunnel is started again if it dies.
 let tunnelChild = null;
 process.on('exit', () => tunnelChild?.kill());
+
+// Local control port, so jobs can be started by a script on this server exactly as if
+// they were tapped in Telegram. It listens on 127.0.0.1 only and is not behind the tunnel.
+function startAdmin() {
+  const port = Number(process.env.ADMIN_PORT || 4101);
+  http.createServer(async (req, res) => {
+    const send = (code, body) => {
+      res.writeHead(code, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(body));
+    };
+    try {
+      const u = new URL(req.url, 'http://local');
+      const q = (k) => u.searchParams.get(k) || '';
+      if (u.pathname === '/jobs') {
+        return send(200, liveJobs().map((j) => ({
+          id: j.id, date: j.date, time: j.clSlot.time, qty: j.qty, have: j.have, state: j.state, tries: j.attempts,
+        })));
+      }
+      if (req.method !== 'POST') return send(404, { error: 'not found' });
+      if (u.pathname === '/hunt') {
+        const date = q('date');
+        const time = q('time');
+        const qty = Number(q('qty') || MAX_QTY);
+        if (!/^\d{4}-\d\d-\d\d$/.test(date) || !/^\d\d:\d\d$/.test(time) || !(qty >= 1 && qty <= MAX_QTY)) {
+          return send(400, { error: 'expected date=YYYY-MM-DD, time=HH:MM, qty=1-7' });
+        }
+        if (liveJobs().some((j) => j.date === date && j.clSlot.time === time)) {
+          return send(409, { error: 'a job for this slot already exists' });
+        }
+        const { slot } = await findSlot(date, time);
+        if (!slot) return send(404, { error: 'the site does not list this time' });
+        const job = await startJob(date, slot, qty);
+        return send(200, { id: job.id });
+      }
+      if (u.pathname === '/stop') {
+        const job = S.jobs.find((j) => j.id === Number(q('id')) && j.state !== 'done');
+        if (!job) return send(404, { error: 'no such job' });
+        await stopJob(job);
+        return send(200, { stopped: job.id });
+      }
+      send(404, { error: 'not found' });
+    } catch (e) {
+      send(500, { error: errText(e) });
+    }
+  }).listen(port, '127.0.0.1', () => log(`Admin port on 127.0.0.1:${port}`));
+}
 
 function startTunnel() {
   const { spawn } = require('child_process');
@@ -1927,6 +2107,7 @@ process.on('unhandledRejection', (e) => log(`⚠️ Unhandled: ${errText(e)}`));
   log(`Up to ${WORKERS} requests in flight, shared by all hunts${GAP_MS ? `, ${GAP_MS}ms gap` : ''}; re-hold every ${Math.round(KEEPALIVE_MS / 1000)}s`);
 
   startCheckoutProxy();
+  startAdmin();
   await startTunnel();
 
   if (TOKEN) {
