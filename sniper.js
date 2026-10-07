@@ -46,6 +46,12 @@ const SLOT_CACHE_MS = 10 * 60e3;
 const CALENDAR_MAX_MS = 30 * 60e3;
 const PROBE_MS = 15e3;
 const MAX_QUICK_RENEWALS = 5;
+// Re-holds running at the same time slow each other down (measured over 1,160 re-holds:
+// median 10s alone, 40s with three or more at once), and a slow in-place re-hold leaves
+// the seats free longer. So only this many run at once, and their start times are spread.
+const MAX_REHOLDS = 2;
+const REHOLD_SPACING_MS = 25e3;
+const QUICK_RETRIES = 2;
 const CARD_CODE = '40.04.23';
 
 // ── State ──────────────────────────────────────────────
@@ -653,7 +659,8 @@ function setHeld(job, sess, cmSlot, codes, heldAt, cart, have) {
     state: 'held', client: sess.client, csrf: sess.csrf, proxyUrl: sess.proxyUrl,
     cmSlot, codes, heldAt, cart: cart || null, have, pending: 0, batches: 1, renewals: 0,
   });
-  if (!job.paying) scheduleKeepAlive(job, Math.max(5000, heldAt + KEEPALIVE_MS - Date.now()));
+  job.quickRetries = 0;
+  if (!job.paying) scheduleKeepAlive(job, planRehold(job));
   scheduleTeam(job);
   saveState();
   startTopUp(job);
@@ -803,6 +810,48 @@ async function cleanCart(job) {
   }
   job.pending = 0;
   return info;
+}
+
+// After a re-hold has booked the new seats, reads the cart until it gives a clear answer.
+// A slow or odd read is never a reason to give the seats up: only a cart proven not to
+// hold them (empty, or a real cart page without them) is. Call it inside withCart.
+async function settleCart(job, keep) {
+  let why = '';
+  for (let i = 0; i < 4; i++) {
+    try {
+      const done = await cleanCart(job);
+      if (!keep.every((c) => done.codes.includes(c))) {
+        return { gone: true, why: `the cart lists ${done.codes.join(', ') || 'no codes'}` };
+      }
+      if (done.people === job.have) {
+        return { cart: { ok: true, checked: true, people: done.people, total: done.total } };
+      }
+      why = `${done.people} people in the cart`;
+    } catch (e) {
+      if (/the cart is empty/.test(errText(e))) return { gone: true, why: 'the cart is empty' };
+      why = errText(e);
+    }
+    await sleep(1500 * (i + 1));
+  }
+  return { cart: { ok: true, checked: false }, why };
+}
+
+// A re-hold that kept its seats without a clean cart read looks again shortly after.
+function recheckCart(job) {
+  const client = job.client;
+  setTimeout(async () => {
+    if (job.state !== 'held' || job.client !== client || job.busy || job.paying) return;
+    const s = await withCart(job, () => settleCart(job, job.codes)).catch(() => null);
+    if (!s || job.state !== 'held' || job.client !== client) return;
+    if (s.gone) {
+      await deleteCodes({ client: job.client, csrf: job.csrf }, job.codes);
+      lostHold(job, `the cart lost the re-held seats (${s.why})`);
+      return;
+    }
+    job.cart = s.cart;
+    log(`${s.cart.checked ? '✅' : '⚠️'} ${jobName(job)}: cart ${s.cart.checked ? `checked after the re-hold: ${s.cart.people} people, ${s.cart.total} €` : `still not readable (${s.why})`}`);
+    saveState();
+  }, 20e3);
 }
 
 // How many seats (up to max) the slot has free right now. The site lists a slot for a
@@ -975,6 +1024,7 @@ async function topUp(job) {
 // again with a new session, so every re-hold is a short window where someone else can win.
 function scheduleKeepAlive(job, ms) {
   clearTimeout(job.timer);
+  job.dueAt = Date.now() + ms;
   job.timer = setTimeout(() => keepAlive(job), ms);
 }
 
@@ -987,10 +1037,13 @@ async function keepAlive(job) {
     return;
   }
   job.busy = true;
+  let gated = false;
   try {
     // Let the stacking loop finish its step before the cart is touched.
     await job.topping;
     await job.chain;
+    await reholdTurn(job);
+    gated = true;
     if (job.state !== 'held' || job.paying || S.stopping) return;
     // Re-holds in one session get slower each round (15s grows to 90s within about ten
     // rounds, measured), so the cart moves to a fresh session before that matters.
@@ -1009,14 +1062,24 @@ async function keepAlive(job) {
     if (res.how) {
       scheduleTeam(job);
       job.renewals++;
+      job.quickRetries = 0;
+      if (!job.cart?.checked) recheckCart(job);
       log(`♻️ Re-held ${job.have} of ${jobName(job)} ${res.how} in ${res.ms}ms (${res.steps}) — ${job.codes.join(', ')}`);
       saveState();
-      scheduleKeepAlive(job, Math.max(5000, job.heldAt + KEEPALIVE_MS - Date.now()));
+      scheduleKeepAlive(job, planRehold(job));
       editJobMsgs(job, heldText(job, `♻️ Re-held ${res.how}, timer reset`), heldKb(job));
       return;
     }
     if (!res.freed) {
-      // Nothing was released: the old hold is intact, so the slower way is still safe.
+      // Nothing was released: the old hold is intact. Trying the quick way again is far
+      // safer than the fresh-session swap, which frees every seat and must win them back.
+      const left = HOLD_TTL_MS - (Date.now() - job.heldAt);
+      if ((job.quickRetries || 0) < QUICK_RETRIES && left > 75e3 && !/more than one batch/.test(errText(res.error))) {
+        job.quickRetries = (job.quickRetries || 0) + 1;
+        log(`⚠️ ${jobName(job)}: quick re-hold not possible (${errText(res.error)}) — nothing was released, trying again in 5s`);
+        scheduleKeepAlive(job, 5000);
+        return;
+      }
       log(`⚠️ ${jobName(job)}: quick re-hold not possible (${errText(res.error)}) — using fresh sessions`);
       await swapToFreshSessions(job);
       return;
@@ -1029,10 +1092,35 @@ async function keepAlive(job) {
     log(`⚠️ ${jobName(job)}: re-hold crashed (${errText(e)}) — trying again in 20s`);
     if (job.state === 'held') scheduleKeepAlive(job, 20e3);
   } finally {
+    if (gated) reholdDone();
     job.rushUntil = 0;
     job.busy = false;
     if (job.state === 'held') startTopUp(job);
   }
+}
+
+// When the next re-hold should start: on time, or moved up to 3 minutes earlier so it
+// starts at least REHOLD_SPACING_MS away from every other planned re-hold.
+function planRehold(job) {
+  const due = job.heldAt + KEEPALIVE_MS;
+  const taken = heldJobs().filter((j) => j !== job && !j.paying && j.dueAt).map((j) => j.dueAt);
+  const clash = (t) => taken.some((x) => Math.abs(x - t) < REHOLD_SPACING_MS);
+  let t = due;
+  while (clash(t) && t > due - 180e3) t -= 5e3;
+  if (clash(t)) t = due;
+  return Math.max(5000, t - Date.now());
+}
+
+const reholdGate = { running: 0, waiting: [] };
+function reholdTurn(job) {
+  if (reholdGate.running < MAX_REHOLDS) { reholdGate.running++; return Promise.resolve(); }
+  return new Promise((r) => reholdGate.waiting.push({ job, r }));
+}
+// The hold closest to expiring goes next.
+function reholdDone() {
+  reholdGate.waiting.sort((a, b) => a.job.heldAt - b.job.heldAt);
+  const next = reholdGate.waiting.shift();
+  if (next) next.r(); else reholdGate.running--;
 }
 
 // Renews the hold inside the cart's own session, with no new sessions.
@@ -1058,9 +1146,18 @@ async function renewInPlace(job, { inPlace = true } = {}) {
     const mark = (name) => { marks.push(`${name} ${Date.now() - last}ms`); last = Date.now(); };
     const steps = () => marks.join(', ');
     try {
-      const before = await cleanCart(job);
+      let before = await cleanCart(job);
+      // Codes the bot did not book (a late reply, a half-finished earlier attempt) would
+      // be mistaken for the new batch and wreck the re-hold, so they go first.
+      const unknown = before ? before.codes.filter((c) => !old.includes(c)) : [];
+      if (unknown.length) {
+        log(`   ${jobName(job)}: the cart holds codes the bot did not book (${unknown.join(', ')}) — releasing them first`);
+        await deleteCodes(sess, unknown);
+        before = await cleanCart(job);
+      }
       mark('check');
-      if (!before || before.people !== n || !old.every((c) => before.codes.includes(c))) {
+      if (!before || before.people !== n || !old.every((c) => before.codes.includes(c))
+        || before.codes.some((c) => !old.includes(c))) {
         throw new Error(`the cart is not as expected (${before?.people} people, ${before?.codes.length} codes)`);
       }
       // One question to the site says whether the slot has n spare seats. Without them
@@ -1123,16 +1220,11 @@ async function renewInPlace(job, { inPlace = true } = {}) {
         }
         if (!cmSlot) throw new Error('Carcere could not be re-booked');
         mark('carcere');
-        const done = await cleanCart(job);
+        const s = await settleCart(job, made);
         mark('verify');
-        if (done.people !== n || done.codes.length !== made.length || !made.every((c) => done.codes.includes(c))) {
-          throw new Error(`cart check failed after the in-place re-hold (${done.people} people, codes ${done.codes.join(',') || 'none'})`);
-        }
-        Object.assign(job, {
-          codes: done.codes, cmSlot, heldAt: bookedAt, pending: 0, batches: 1,
-          cart: { ok: true, checked: true, people: done.people, total: done.total },
-        });
-        return { how, ms: Date.now() - started, steps: steps() };
+        if (s.gone) throw new Error(`the new seats are not in the cart (${s.why})`);
+        Object.assign(job, { codes: made, cmSlot, heldAt: bookedAt, pending: 0, batches: 1, cart: s.cart });
+        return { how: s.cart.checked ? how : `${how}, cart check pending (${s.why})`, ms: Date.now() - started, steps: steps() };
       }
       const clNew = fresh(info);
       let cmSlot = null;
@@ -1144,25 +1236,24 @@ async function renewInPlace(job, { inPlace = true } = {}) {
       }
       if (!cmSlot) throw new Error('no Carcere time could be booked for the new batch');
       const keep = fresh(info);
-      if (!freed) {
-        await deleteCodes(sess, old);
-        freed = true;
+      mark('carcere');
+      await deleteCodes(sess, old);
+      freed = true;
+      mark('release old');
+      const s = await settleCart(job, keep);
+      mark('verify');
+      if (s.gone) {
+        made = keep;
+        throw new Error(`the new seats are not in the cart (${s.why})`);
       }
-      // Drops the old, now unbooked, people from the cart and reads the final state.
-      const done = await cleanCart(job);
-      if (done.people !== n || done.codes.length !== keep.length || !keep.every((c) => done.codes.includes(c))) {
-        throw new Error(`cart check failed after the re-hold (${done.people} people, codes ${done.codes.join(',') || 'none'})`);
-      }
-      Object.assign(job, {
-        codes: done.codes, cmSlot, heldAt: bookedAt, pending: 0, batches: 1,
-        cart: { ok: true, checked: true, people: done.people, total: done.total },
-      });
-      mark('carcere, release old, verify');
-      return { how, ms: Date.now() - started, steps: steps() };
+      Object.assign(job, { codes: keep, cmSlot, heldAt: bookedAt, pending: 0, batches: 1, cart: s.cart });
+      return { how: s.cart.checked ? how : `${how}, cart check pending (${s.why})`, ms: Date.now() - started, steps: steps() };
     } catch (error) {
       log(`   re-hold steps before the failure: ${steps() || 'none'}`);
-      // Leave nothing behind in this session that the bot does not know about:
-      // first what the replies reported, then anything else the cart page still lists.
+      // Leave nothing behind in this session that the bot does not know about: first
+      // what the replies reported, then anything else the cart page still lists. After a
+      // release this runs only once settleCart has proven the new seats are not in the
+      // cart, so freeing them lets the hunt catch them again.
       if (made.length) await deleteCodes(sess, made).catch(() => {});
       try {
         const now = await cartInfo(sess);
@@ -1273,7 +1364,7 @@ async function stopJob(job, { keep = false, head } = {}) {
 function resumeReholds(job) {
   if (job.state !== 'held' || !job.paying) return;
   job.paying = 0;
-  scheduleKeepAlive(job, Math.max(1000, job.heldAt + KEEPALIVE_MS - Date.now()));
+  scheduleKeepAlive(job, planRehold(job));
   saveState();
   startTopUp(job);
 }
