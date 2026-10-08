@@ -83,6 +83,8 @@ const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replac
 const tickets = (n) => `${n} ticket${n === 1 ? '' : 's'}`;
 const newToken = () => crypto.randomBytes(9).toString('base64url');
 const CHECKOUT_URL = `${BASE}/${LOC}/vouchers/checkout`;
+const THANKYOU_URL = `${BASE}/${LOC}/vouchers/thankyoupage`;
+const PAY_POLL_MS = 5000;
 
 function errText(e) {
   const parts = [];
@@ -204,12 +206,16 @@ async function loadState() {
       for (let i = 0; i < 3; i++) {
         try { gone = cartIsEmpty(await client.http('GET', CHECKOUT_URL)); break; } catch { await sleep(1000); }
       }
-      if (!gone) {
+      // A payment finished while the bot was down also empties the cart.
+      const paid = gone && h.paying && await paidBySite(client);
+      if (!gone || paid) {
         job.paying = h.paying || 0;
         setHeld(job, { client, csrf: h.csrf, proxyUrl: h.proxyUrl }, h.cmSlot, h.codes, h.heldAt, h.cart, h.have || d.qty);
         // Unknown for carts saved by an older version: assume several, the cautious case.
         job.batches = h.batches || 2;
+        if (paid) { await announcePurchase(job); continue; }
         log(`  ✅ ${jobName(job)} still held, ${job.have}/${job.qty} (${ttlStr(job)} left)${job.paying ? ' — payment started, re-holding paused' : ''}`);
+        if (job.paying) watchPayment(job);
         continue;
       }
       client.close();
@@ -1329,6 +1335,7 @@ async function checkHeldJobs() {
     try { r = await client.http('GET', CHECKOUT_URL); } catch { continue; }
     if (!cartIsEmpty(r) || job.state !== 'held' || job.client !== client || job.busy) continue;
     if (job.paying) {
+      if (await paidBySite(client)) { await announcePurchase(job); continue; }
       await stopJob(job, {
         keep: true,
         head: '🧾 <b>Cart closed after payment started</b> — job finished\nIf the payment did not go through, start a new hunt.',
@@ -1379,6 +1386,33 @@ function announcePayStarted(job) {
     `⏱ The hold has about ${left} left: finish the payment before then.`,
     payKb(job),
   );
+  watchPayment(job);
+}
+
+// Nexi sends the browser back to the real site, never through the checkout link, but the
+// thank-you page belongs to the session and the bot holds its cookies. Measured on an
+// unpaid order: the page redirects to the checkout and leaves the cart alone.
+async function paidBySite(client) {
+  try {
+    const r = await client.http('GET', THANKYOU_URL);
+    return r.status === 200 && /data-action=["']thankyoupage["']/.test(r.text);
+  } catch { return false; }
+}
+
+async function announcePurchase(job) {
+  if (job.state !== 'held') return;
+  log(`🎉 Payment confirmed by the site for ${jobName(job)}`);
+  tgNotify(`🎉 <b>Payment successful</b> — ${job.date} ${job.clSlot.time} · ${tickets(job.have)}\nThe site shows its order confirmation. The voucher goes to the email given at checkout.`);
+  await stopJob(job, { keep: true, head: '🎉 <b>Purchased</b> — the site confirmed the payment' });
+}
+
+async function watchPayment(job) {
+  const since = job.paying;
+  while (job.state === 'held' && job.paying === since && !S.stopping) {
+    await sleep(PAY_POLL_MS);
+    if (job.state !== 'held' || job.paying !== since || job.busy) continue;
+    if (await paidBySite(job.client)) return announcePurchase(job);
+  }
 }
 
 const payKb = (job) => ({ inline_keyboard: [
@@ -1639,7 +1673,8 @@ function startCheckoutProxy() {
           if (ct.includes('text/html')) {
             let html = result.toString();
             html = html.replace(/https:\/\/www\.omniavaticanrome\.org/g, base);
-            html = html.replace(/(href|src|action)="\/(?!\/)([^"]*?)"/g, `$1="/${job.token}/$2"`);
+            // The pay page quotes its card-payment link with ' and some links not at all.
+            html = html.replace(/(href|src|action)=(["']?)\/(?!\/)/g, `$1=$2/${job.token}/`);
             result = Buffer.from(html);
           }
 
@@ -1866,7 +1901,8 @@ async function cliJobs() {
     const paid = c.startsWith('p');
     const j = jobs[parseInt(paid ? c.slice(1) : c) - 1];
     if (!j) continue;
-    if (paid) await stopJob(j, { keep: true, head: '💳 <b>Paid</b> — re-holding stopped' });
+    if (paid && j.state === 'held' && await paidBySite(j.client)) await announcePurchase(j);
+    else if (paid) await stopJob(j, { keep: true, head: '💳 <b>Paid</b> — re-holding stopped' });
     else await stopJob(j);
   }
 }
@@ -2049,7 +2085,8 @@ async function jobAction(act, job, chatId, msgId, fromMenu) {
   }
   if (act === 'paid' || act === 'paidok') {
     if (job.state !== 'held') return;
-    await stopJob(job, { keep: true, head: '💳 <b>Paid</b> — re-holding stopped' });
+    if (await paidBySite(job.client)) await announcePurchase(job);
+    else await stopJob(job, { keep: true, head: '💳 <b>Paid</b> — re-holding stopped' });
     dropButtons();
   } else if (act === 'resume') {
     if (job.state === 'held' && job.paying) {
